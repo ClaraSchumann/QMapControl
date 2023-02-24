@@ -179,6 +179,8 @@ namespace qmapcontrol
 
     void NetworkManager::downloadFinished(QNetworkReply* reply)
     {
+        qDebug() << QString("Remaining: %1").arg(downloadQueueSize());
+
         // Did the reply return no errors...
         if(reply->error() != QNetworkReply::NoError)
         {

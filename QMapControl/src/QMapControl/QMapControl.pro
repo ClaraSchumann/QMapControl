@@ -22,6 +22,7 @@ DEFINES += QMAPCONTROL_LIBRARY
 
 # Add header files.
 HEADERS +=                                      \
+    ImageLoadingPriority.h \
     qmapcontrol_global.h                        \
     Geometry.h                                  \
     GeometryLineString.h                        \

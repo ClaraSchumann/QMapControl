@@ -32,15 +32,20 @@
 #include <QtCore/QUrl>
 #include <QtGui/QPixmap>
 #include <QtNetwork/QNetworkProxy>
+#include <QThread>
 
 // STL includes.
 #include <chrono>
 #include <map>
 #include <memory>
+#include <thread>
+#include <atomic>
+#include <mutex>
 
 // Local includes.
 #include "qmapcontrol_global.h"
 #include "NetworkManager.h"
+#include "ImageLoadingPriority.h"
 
 /*!
  * @author Kai Winter <kaiwinter@gmx.de>
@@ -48,6 +53,11 @@
  */
 namespace qmapcontrol
 {
+    struct LoadingTask{
+        void* image_user;
+        QUrl url;
+    };
+
     class QMAPCONTROL_EXPORT ImageManager : public QObject
     {
         Q_OBJECT
@@ -69,7 +79,7 @@ namespace qmapcontrol
         ///ImageManager& operator=(const ImageManager&) = delete; @todo re-add once MSVC supports default/delete syntax.
 
         //! Destructor.
-        ~ImageManager() { } /// = default; @todo re-add once MSVC supports default/delete syntax.
+        ~ImageManager(); /// = default; @todo re-add once MSVC supports default/delete syntax.
 
         /*!
          * Fetch the tile size in pixels.
@@ -119,18 +129,13 @@ namespace qmapcontrol
          * @param url The image url to fetch.
          * @return the pixmap of the image.
          */
-        QPixmap getImage(const QUrl& url);
+        QPixmap getImage(const QUrl& url, ImageLoadingPriority priority, void* image_user);
 
         /*!
-         * Fetches the requested image using the getImage function, which has been deemed
-         * "offscreen".
-         * However, if the image need to be fetched from the network, the "imageReceived" will be
-         * emitted on particular hardware platforms only (Eg: mobile platforms do not receive the
-         * "imageReceived" emission.
-         * @param url The image url to fetch.
-         * @return the pixmap of the image.
+         * Clear all the loading queue.
+         *
          */
-        QPixmap prefetchImage(const QUrl& url);
+        void clearLoadingQueue();
 
         /*!
          * \brief setLoadingPixmap sets the pixmap displayed when a tile is not yet loaded
@@ -220,6 +225,9 @@ namespace qmapcontrol
          */
         bool persistentCacheInsert(const QUrl& url, const QPixmap& pixmap);
 
+        /// submit download task to NetworkManager
+        void dispatch_worker();
+
     private:
         /// Network manager.
         NetworkManager m_nm;
@@ -244,5 +252,15 @@ namespace qmapcontrol
 
         /// The persistent cache's image expiry.
         std::chrono::minutes m_persistent_cache_expiry;
+
+        /// members related to operations on LoadingTask queue.
+        QVector<LoadingTask> m_display_queue;
+        QVector<LoadingTask> m_buffer_queue;
+        QVector<LoadingTask> m_prefetch_queue;
+
+        std::mutex m_dispatch_mutex;
+        std::atomic<bool> m_dispatch_worker_thread_exit;
+        std::condition_variable m_dispatch_cv;
+        std::thread m_dispatch_worker_thread;
     };
 }

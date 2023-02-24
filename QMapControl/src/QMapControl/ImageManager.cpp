@@ -1,27 +1,27 @@
 /*
-*
-* This file is part of QMapControl,
-* an open-source cross-platform map widget
-*
-* Copyright (C) 2007 - 2008 Kai Winter
-*
-* This program is free software: you can redistribute it and/or modify
-* it under the terms of the GNU Lesser General Public License as published by
-* the Free Software Foundation, either version 3 of the License, or
-* (at your option) any later version.
-*
-* This program is distributed in the hope that it will be useful,
-* but WITHOUT ANY WARRANTY; without even the implied warranty of
-* MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-* GNU Lesser General Public License for more details.
-*
-* You should have received a copy of the GNU Lesser General Public License
-* along with QMapControl. If not, see <http://www.gnu.org/licenses/>.
-*
-* Contact e-mail: kaiwinter@gmx.de
-* Program URL   : http://qmapcontrol.sourceforge.net/
-*
-*/
+ *
+ * This file is part of QMapControl,
+ * an open-source cross-platform map widget
+ *
+ * Copyright (C) 2007 - 2008 Kai Winter
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Lesser General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public License
+ * along with QMapControl. If not, see <http://www.gnu.org/licenses/>.
+ *
+ * Contact e-mail: kaiwinter@gmx.de
+ * Program URL   : http://qmapcontrol.sourceforge.net/
+ *
+ */
 
 #include "ImageManager.h"
 
@@ -34,13 +34,15 @@
 // Local includes.
 #include "Projection.h"
 
+#define QMAP_DEBUG
+
 namespace qmapcontrol
 {
     namespace
     {
         /// Singleton instance of Image Manager.
         std::unique_ptr<ImageManager> m_instance = nullptr;
-    }
+    } // namespace
 
     ImageManager& ImageManager::get()
     {
@@ -66,17 +68,58 @@ namespace qmapcontrol
           m_tile_size_px(tile_size_px),
           m_pixmap_loading(),
           m_persistent_cache(false),
-          m_persistent_cache_expiry(0)
+          m_persistent_cache_expiry(0),
+          m_dispatch_mutex(),
+          m_dispatch_worker_thread_exit(false),
+          m_dispatch_cv(),
+          m_dispatch_worker_thread(&ImageManager::dispatch_worker, this)
     {
         // Setup a loading pixmap.
         setupLoadingPixmap();
 
         // Connect signal/slot for image downloads.
         QObject::connect(this, &ImageManager::downloadImage, &m_nm, &NetworkManager::downloadImage);
-        QObject::connect(&m_nm, &NetworkManager::imageDownloaded, this, &ImageManager::imageDownloaded);
-        QObject::connect(&m_nm, &NetworkManager::downloadingInProgress, this, &ImageManager::downloadingInProgress);
-        QObject::connect(&m_nm, &NetworkManager::downloadingFinished, this, &ImageManager::downloadingFinished);
+        QObject::connect(&m_nm, &NetworkManager::imageDownloaded, this,
+                         &ImageManager::imageDownloaded);
+        QObject::connect(&m_nm, &NetworkManager::downloadingInProgress, this,
+                         &ImageManager::downloadingInProgress);
+        QObject::connect(&m_nm, &NetworkManager::downloadingFinished, this,
+                         &ImageManager::downloadingFinished);
     }
+
+    ImageManager::~ImageManager(){
+        m_dispatch_worker_thread_exit = true;
+        if(m_dispatch_worker_thread.joinable()) {
+            m_dispatch_worker_thread.join();
+        }
+    };
+
+    void ImageManager::dispatch_worker(){
+        while(!m_dispatch_worker_thread_exit){
+            std::unique_lock<std::mutex> lk(m_dispatch_mutex);
+            auto not_empty = [this]() -> bool {
+                // Here, `m_dispatch_mutex` has been locked by this function, don't worry.
+                return m_display_queue.size() + m_buffer_queue.size() +
+                       m_prefetch_queue.size();
+            };
+            try{
+                m_dispatch_cv.wait(lk, not_empty);
+            }
+            catch(std::exception& e){
+                qDebug() << e.what();
+            };
+
+            auto download_next_n_from_queue = [this](QVector<LoadingTask>& queue, int n){
+                for(int i = 0; i < n; ++i) {
+                    emit downloadImage(queue.back().url);
+                    queue.pop_back();
+                };
+            };
+            download_next_n_from_queue(m_display_queue, m_display_queue.size());
+            // download_next_n_from_queue(m_buffer_queue, m_buffer_queue.size());
+            // download_next_n_from_queue(m_prefetch_queue, m_prefetch_queue.size());
+        };
+    };
 
     int ImageManager::tileSizePx() const
     {
@@ -120,7 +163,8 @@ namespace qmapcontrol
         else
         {
             // Log error.
-            qDebug() << "Unable to create directory for persistent cache '" << path.absolutePath() << "'";
+            qDebug() << "Unable to create directory for persistent cache '" << path.absolutePath()
+                     << "'";
         }
 
         // Return success.
@@ -139,8 +183,29 @@ namespace qmapcontrol
         return m_nm.downloadQueueSize();
     }
 
-    QPixmap ImageManager::getImage(const QUrl& url)
+    QPixmap ImageManager::getImage(const QUrl& url, ImageLoadingPriority priority, void* image_user)
     {
+        auto dispatch_to_queue = [&]()
+        {
+            std::lock_guard<std::mutex> lk(m_dispatch_mutex);
+            switch(priority)
+            {
+                case ImageLoadingPriority::Display:
+                    m_display_queue.push_back(LoadingTask{ image_user, url });
+                    break;
+                case ImageLoadingPriority::Buffer:
+                    m_buffer_queue.push_back(LoadingTask{ image_user, url });
+                    break;
+                case ImageLoadingPriority::Prefetch:
+                    m_prefetch_queue.push_back(LoadingTask{ image_user, url });
+                    break;
+                default:
+                    ;
+            };
+
+            m_dispatch_cv.notify_all();
+        };
+
         // Holding resource for image to be loaded into.
         QPixmap return_pixmap(m_pixmap_loading);
 
@@ -166,13 +231,13 @@ namespace qmapcontrol
                 else
                 {
                     // Emit that we need to download the image using the network manager.
-                    emit downloadImage(url);
+                    dispatch_to_queue();
                 }
             }
             else
             {
                 // Emit that we need to download the image using the network manager.
-                emit downloadImage(url);
+                dispatch_to_queue();
             }
         }
 
@@ -180,19 +245,7 @@ namespace qmapcontrol
         return return_pixmap;
     }
 
-    QPixmap ImageManager::prefetchImage(const QUrl& url)
-    {
-        // Add the url to the prefetch list.
-        m_prefetch_urls.append(url);
-
-        // Return the image for the url.
-        return getImage(url);
-    }
-
-    void ImageManager::setLoadingPixmap(const QPixmap &pixmap)
-    {
-        m_pixmap_loading = pixmap;
-    }
+    void ImageManager::setLoadingPixmap(const QPixmap& pixmap) { m_pixmap_loading = pixmap; }
 
     void ImageManager::imageDownloaded(const QUrl& url, const QPixmap& pixmap)
     {
@@ -244,7 +297,12 @@ namespace qmapcontrol
     QString ImageManager::md5hex(const QUrl& url)
     {
         // Return the md5 hex value of the given url at a specific projection and tile size.
-        return QString(QCryptographicHash::hash((url.toString() + QString::number(projection::get().epsg()) + QString::number(m_tile_size_px)).toUtf8(), QCryptographicHash::Md5).toHex());
+        return QString(
+            QCryptographicHash::hash((url.toString() + QString::number(projection::get().epsg())
+                                      + QString::number(m_tile_size_px))
+                                         .toUtf8(),
+                                     QCryptographicHash::Md5)
+                .toHex());
     }
 
     QString ImageManager::persistentCacheFilename(const QUrl& url)
@@ -270,14 +328,18 @@ namespace qmapcontrol
             // Is the persistent cache expiry set, and if so is the file older than the expiry time
             // allowed?
             if(m_persistent_cache_expiry.count() > 0
-               && file_info.lastModified().msecsTo(QDateTime::currentDateTime()) > std::chrono::duration_cast<std::chrono::milliseconds>(m_persistent_cache_expiry).count())
+               && file_info.lastModified().msecsTo(QDateTime::currentDateTime())
+                      > std::chrono::duration_cast<std::chrono::milliseconds>(
+                            m_persistent_cache_expiry)
+                            .count())
             {
                 // The file is too old, remove it.
                 m_persistent_cache_directory.remove(file.fileName());
 
                 // Log removing the file.
 #ifdef QMAP_DEBUG
-                qDebug() << "Removing '" << file.fileName() << "' from persistent cache for url '" << url << "'";
+                qDebug() << "Removing '" << file.fileName() << "' from persistent cache for url '"
+                         << url << "'";
 #endif
             }
             else
@@ -296,4 +358,5 @@ namespace qmapcontrol
         // Return the result of saving the pixmap to the persistent cache.
         return pixmap.save(persistentCacheFilename(url), "PNG");
     }
-}
+
+} // namespace qmapcontrol
