@@ -78,8 +78,11 @@ namespace qmapcontrol
           m_dispatch_mutex(),
           m_dispatch_worker_thread_exit(false),
           m_dispatch_cv(),
-          m_dispatch_worker_thread(&ImageManager::dispatch_worker, this)
+          m_dispatch_worker_thread()
     {
+        connect(&m_timer, &QTimer::timeout, this, &ImageManager::dispatch_worker);
+        m_timer.start(1500);
+
         // Setup a loading pixmap.
         setupLoadingPixmap();
 
@@ -105,7 +108,7 @@ namespace qmapcontrol
 
     void ImageManager::dispatch_worker()
     {
-        while(!m_dispatch_worker_thread_exit)
+        if(true)
         {
             static int count = 0;
             ++count;
@@ -119,7 +122,7 @@ namespace qmapcontrol
             };
             try
             {
-                m_dispatch_cv.wait(lk, continue_predicate);
+                // m_dispatch_cv.wait(lk, continue_predicate);
             }
             catch(std::exception& e)
             {
@@ -233,7 +236,6 @@ namespace qmapcontrol
         auto to_queue = [&]()
         {
             static int delivered_count = 0;
-            qDebug() << QString("Having delivered %1 to queue.").arg(++delivered_count);
             std::lock_guard<std::mutex> lk(m_dispatch_mutex);
             switch(priority)
             {
@@ -298,10 +300,6 @@ namespace qmapcontrol
     void ImageManager::imageDownloaded(const QUrl& url, const QPixmap& pixmap)
     {
         m_nm.getRemainingConnectionNumber() || (m_dispatch_cv.notify_all(), true);
-
-#ifdef QMAP_DEBUG
-        qDebug() << "ImageManager::imageDownloaded '" << url << "'";
-#endif
 
         // Add it to the pixmap cache.
         m_pixmap_cache[md5hex(url)] = pixmap;
