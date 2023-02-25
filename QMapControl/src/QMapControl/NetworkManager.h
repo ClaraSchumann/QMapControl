@@ -64,6 +64,8 @@ namespace qmapcontrol
         //! Destructor.
         ~NetworkManager();
 
+        int getRemainingConnectionNumber();
+
         /*!
          * Set the network proxy to use.
          * @param proxy The network proxy to use.
@@ -144,5 +146,7 @@ namespace qmapcontrol
 
         /// Mutex protecting downloading image queue.
         mutable QMutex m_mutex_downloading_image;
+
+        int maximumConnectionNumber;
     };
 }

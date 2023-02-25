@@ -56,6 +56,7 @@ namespace qmapcontrol
     struct LoadingTask{
         void* image_user;
         QUrl url;
+        bool operator==(const LoadingTask& other) const;
     };
 
     class QMAPCONTROL_EXPORT ImageManager : public QObject

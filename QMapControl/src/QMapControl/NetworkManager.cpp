@@ -36,7 +36,8 @@
 
 namespace qmapcontrol
 {
-    NetworkManager::NetworkManager(QObject* parent) : QObject(parent)
+    NetworkManager::NetworkManager(QObject* parent) : QObject(parent),
+                                                      maximumConnectionNumber(10)
     {
         // Connect signal/slot to handle proxy authentication.
         QObject::connect(&m_nam, &QNetworkAccessManager::proxyAuthenticationRequired, this, &NetworkManager::proxyAuthenticationRequired);
@@ -49,6 +50,10 @@ namespace qmapcontrol
     {
         // Ensure all download queues are aborted.
         abortDownloads();
+    }
+
+    int NetworkManager::getRemainingConnectionNumber(){
+        return std::max(0, maximumConnectionNumber - downloadQueueSize());
     }
 
     void NetworkManager::setProxy(const QNetworkProxy& proxy)

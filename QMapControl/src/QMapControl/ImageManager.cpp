@@ -44,6 +44,11 @@ namespace qmapcontrol
         std::unique_ptr<ImageManager> m_instance = nullptr;
     } // namespace
 
+    bool LoadingTask::operator==(const LoadingTask& other) const
+    {
+        return (other.image_user == image_user) && (other.url == url);
+    }
+
     ImageManager& ImageManager::get()
     {
         // Does the singleton instance exist?
@@ -63,6 +68,7 @@ namespace qmapcontrol
         m_instance.reset(nullptr);
     }
 
+    // Make sure m_nm
     ImageManager::ImageManager(const int& tile_size_px, QObject* parent)
         : QObject(parent),
           m_tile_size_px(tile_size_px),
@@ -87,37 +93,69 @@ namespace qmapcontrol
                          &ImageManager::downloadingFinished);
     }
 
-    ImageManager::~ImageManager(){
+    ImageManager::~ImageManager()
+    {
         m_dispatch_worker_thread_exit = true;
-        if(m_dispatch_worker_thread.joinable()) {
+        m_dispatch_cv.notify_one();
+        if(m_dispatch_worker_thread.joinable())
+        {
             m_dispatch_worker_thread.join();
         }
     };
 
-    void ImageManager::dispatch_worker(){
-        while(!m_dispatch_worker_thread_exit){
+    void ImageManager::dispatch_worker()
+    {
+        while(!m_dispatch_worker_thread_exit)
+        {
+            static int count = 0;
+            ++count;
             std::unique_lock<std::mutex> lk(m_dispatch_mutex);
-            auto not_empty = [this]() -> bool {
-                // Here, `m_dispatch_mutex` has been locked by this function, don't worry.
-                return m_display_queue.size() + m_buffer_queue.size() +
-                       m_prefetch_queue.size();
+            auto continue_predicate = [this]() -> bool
+            {
+                // Here, `m_dispatch_mutex` has been locked inside `dispatch_worker, don't worry.
+                return m_nm.getRemainingConnectionNumber()
+                       && (m_display_queue.size() + m_buffer_queue.size()
+                           + m_prefetch_queue.size());
             };
-            try{
-                m_dispatch_cv.wait(lk, not_empty);
+            try
+            {
+                m_dispatch_cv.wait(lk, continue_predicate);
             }
-            catch(std::exception& e){
+            catch(std::exception& e)
+            {
                 qDebug() << e.what();
             };
 
-            auto download_next_n_from_queue = [this](QVector<LoadingTask>& queue, int n){
-                for(int i = 0; i < n; ++i) {
+            int connection_to_be_established = m_nm.getRemainingConnectionNumber();
+#define QMAP_DEBUG
+#ifdef QMAP_DEBUG
+            int tmp = connection_to_be_established;
+            qDebug() << QString("Loop count %1").arg(count);
+#endif
+            auto download_from_queue
+                = [this, &connection_to_be_established](QVector<LoadingTask>& queue)
+            {
+                int num_download_from_queue = std::min(queue.size(), connection_to_be_established);
+                connection_to_be_established -= num_download_from_queue;
+                for(int i = 0; i < num_download_from_queue; ++i)
+                {
                     emit downloadImage(queue.back().url);
                     queue.pop_back();
                 };
             };
-            download_next_n_from_queue(m_display_queue, m_display_queue.size());
-            // download_next_n_from_queue(m_buffer_queue, m_buffer_queue.size());
-            // download_next_n_from_queue(m_prefetch_queue, m_prefetch_queue.size());
+
+            // After the task is sent to m_nm, it needs some time (perhaps a few milliseconds?) for
+            // Qt Framework to deliver the message, during which this loop will execute a few
+            // thousand times, until exhausting the task queue.
+            download_from_queue(m_display_queue);
+            download_from_queue(m_buffer_queue);
+            download_from_queue(m_prefetch_queue);
+
+#ifdef QMAP_DEBUG
+            qDebug()
+                << QString("Deliver %1 new tasks to m_nm").arg(tmp - connection_to_be_established);
+#endif
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
         };
     };
 
@@ -185,22 +223,30 @@ namespace qmapcontrol
 
     QPixmap ImageManager::getImage(const QUrl& url, ImageLoadingPriority priority, void* image_user)
     {
-        auto dispatch_to_queue = [&]()
+        LoadingTask candidate{ image_user, url };
+        auto not_in_queue = [&]() -> bool
         {
+            std::lock_guard<std::mutex> lk(m_dispatch_mutex);
+            return !m_display_queue.contains(candidate) && !m_buffer_queue.contains(candidate)
+                   && !m_prefetch_queue.contains(candidate);
+        };
+        auto to_queue = [&]()
+        {
+            static int delivered_count = 0;
+            qDebug() << QString("Having delivered %1 to queue.").arg(++delivered_count);
             std::lock_guard<std::mutex> lk(m_dispatch_mutex);
             switch(priority)
             {
                 case ImageLoadingPriority::Display:
-                    m_display_queue.push_back(LoadingTask{ image_user, url });
+                    m_display_queue.push_back(candidate);
                     break;
                 case ImageLoadingPriority::Buffer:
-                    m_buffer_queue.push_back(LoadingTask{ image_user, url });
+                    m_buffer_queue.push_back(candidate);
                     break;
                 case ImageLoadingPriority::Prefetch:
-                    m_prefetch_queue.push_back(LoadingTask{ image_user, url });
+                    m_prefetch_queue.push_back(candidate);
                     break;
-                default:
-                    ;
+                default:;
             };
 
             m_dispatch_cv.notify_all();
@@ -210,7 +256,9 @@ namespace qmapcontrol
         QPixmap return_pixmap(m_pixmap_loading);
 
         // Is the image already been downloaded by the network manager?
-        if(m_nm.isDownloading(url) == false)
+        // Strictly speaking, this statement is not reliable. Message passing in
+        // Qt framework is time consuming, so duplicated request may exist.
+        if(not_in_queue() && (m_nm.isDownloading(url) == false))
         {
             // Is the image in our volatile "in-memory" cache?
             const auto find_itr = m_pixmap_cache.find(md5hex(url));
@@ -231,13 +279,13 @@ namespace qmapcontrol
                 else
                 {
                     // Emit that we need to download the image using the network manager.
-                    dispatch_to_queue();
+                    to_queue();
                 }
             }
             else
             {
                 // Emit that we need to download the image using the network manager.
-                dispatch_to_queue();
+                to_queue();
             }
         }
 
@@ -249,6 +297,8 @@ namespace qmapcontrol
 
     void ImageManager::imageDownloaded(const QUrl& url, const QPixmap& pixmap)
     {
+        m_nm.getRemainingConnectionNumber() || (m_dispatch_cv.notify_all(), true);
+
 #ifdef QMAP_DEBUG
         qDebug() << "ImageManager::imageDownloaded '" << url << "'";
 #endif
